@@ -45,35 +45,60 @@ end
                                                           {'y','x',char(specLabel)});
 
 dori                = MRSIStruct.data;           % [ny × nx × nspec]
-[ny, nx, nSpectra]  = size(dori);
+% Get dimensions
+[ny,nx,nSpectra] = size(dori);
 
-doricol             = reshape(dori, [], nSpectra);  % [(ny·nx) × nspec]
+% Reshape into column
+doricol = reshape(dori,[],nSpectra);
 
-%% 3. Find ppm indices of lipid window
-ppm          = MRSIStruct.ppm(:).';              % row vector
-[~, startidx] = min(abs(ppm - maxppm));          % higher ppm first
-[~, endidx]   = min(abs(ppm - minppm));          % lower  ppm second
-if endidx < startidx, idxRange = startidx:endidx; else, idxRange = endidx:startidx; end
+% Define ppm lipid bounds
+lowppmlip = minppm;
+highppmlip = maxppm;
 
-%% 4. Build lipid-only matrix and run SVD
-dorilip = doricol(:, idxRange);                  % [(ny·nx) × Nlip]
+%% Find the index for the ppm bounds
 
-if useEcon
-    [U,~,~] = svd(dorilip, 'econ');
-else
-    [U,~,~] = svd(dorilip);
+% Calculate absolute differences
+lowdiff = abs(MRSIStruct.ppm - lowppmlip);
+highdiff = abs(MRSIStruct.ppm - highppmlip);
+
+% Find the index of the minimum difference
+[~, endidx] = min(lowdiff);
+[~, startidx] = min(highdiff);
+
+%%
+% Initialize dorilip matrix
+numspecpoints = abs(endidx-startidx) + 1;
+dorilip = zeros(ny * nx, numspecpoints);
+
+% Extract lipid peak points at each voxel
+for i = 1:ny*nx
+    dorilip(i, :) = doricol(i,startidx:endidx);
 end
-Um = U(:, 1:min(m,size(U,2)));                   % keep first m comps
 
-%% 5. Project out lipid sub-space
-P    = eye(size(Um,1)) - Um*Um.';                % projection matrix
-dsup = P * doricol;                              % SSP-filtered data
+% Perform SVD
+if useEcon
+    [U, ~, ~] = svd(dorilip, 'econ');
+else
+    [U, ~, ~] = svd(dorilip);
+end
 
-%% 6. Reshape back and restore original order
-dsup = reshape(dsup, ny, nx, nSpectra);          % [ny × nx × spec]
-MRSIStruct = setData(MRSIStruct, dsup);          % put back into struct
+% Modify SVD matrices to only include first m spatial components
+Um = U(:, 1:m);
+
+% Calculate projection matrix
+P = eye(size(Um, 1)) - Um * Um';
+
+% Apply the projection matrix to original image
+dsup = P * doricol;
+
+% Reshape to (y,x,t)
+dsup = reshape(dsup, ny, nx, nSpectra);
+MRSIStruct = setData(MRSIStruct,dsup);
+
+% Permute back into (t,y,x)
 MRSIStruct = reshapeBack(MRSIStruct, pastOrder, currentOrder);
 end
+
 
 %learn svd 
 % % op_CSIssp.m
