@@ -1,7 +1,7 @@
 %% === INPUTS ===
-fileName = 'C:\Users\divya\Downloads\fid-a-main\fid-a-main\data\meas_MID00513_FID124500_lb_RosetteSpinEcho_ek_v1a_48x48_te20.dat';
-fileName_w = 'C:\Users\divya\Downloads\fid-a-main\fid-a-main\data\meas_MID00514_FID124501_lb_RosetteSpinEcho_ek_v1a_48x48_te20_w.dat';
-kFile = 'C:\Users\divya\Downloads\fid-a-main\fid-a-main\data\Rosette_traj_48x48.txt';
+fileName = 'C:\Users\divya\Downloads\Lexar\DataForDivya\invivo_10Sep2024_40x40_rose\invivo_10Sep2024_40x40_rose\meas_MID01415_FID95676_lb_RosetteSpinEcho_ek_v1a.dat';
+fileName_w = 'C:\Users\divya\Downloads\Lexar\DataForDivya\invivo_10Sep2024_40x40_rose\invivo_10Sep2024_40x40_rose\meas_MID01416_FID95677_lb_RosetteSpinEcho_ek_v1a_w.dat';
+kFile = 'C:\Users\divya\Downloads\Lexar\DataForDivya\invivo_10Sep2024_40x40_rose\invivo_10Sep2024_40x40_rose\RosetteTraj_40x40_sw1587p3.txt';
 
 fprintf('=== TWO FILE NON-CARTESIAN MODE ===\n');
 
