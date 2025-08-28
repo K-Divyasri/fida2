@@ -8,11 +8,11 @@ fprintf('=== TWO FILE NON-CARTESIAN MODE ===\n');
 %% === LOAD TWIX FILES ===
 [timeCombined_sh, timeCombined_sh_w] = load_twix2(fileName, fileName_w,kFile);
 
-nComp = 8;  % choose, e.g., 8 virtual channels out of your 32
-[timeCombined,  W] = op_CSICoilCompression_SVD(timeCombined_sh,  nComp);
-[timeCombined_w, ~] = op_CSICoilCompression_SVD(timeCombined_sh_w, nComp, false);
-timeCombined_w.coilCompression.W = W;    % overwrite voxel weights
- % overwrite voxel weights
+% nComp = 8;  % choose, e.g., 8 virtual channels out of your 32
+% [timeCombined,  W] = op_CSICoilCompression_SVD(timeCombined_sh,  nComp);
+% [timeCombined_w, ~] = op_CSICoilCompression_SVD(timeCombined_sh_w, nComp, false);
+% timeCombined_w.coilCompression.W = W;    % overwrite voxel weights
+%  % overwrite voxel weights
 
 %% === RESHAPE ===
 timeCombined_rs = reshape_twix_data(timeCombined_sh,kFile);

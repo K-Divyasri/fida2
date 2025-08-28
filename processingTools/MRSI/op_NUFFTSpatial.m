@@ -1,555 +1,556 @@
-function ftSpatial = op_NUFFTSpatial(dComp, kFile_path)
-    % OPTIMIZED VERSION: Minimized memory allocations and redundant operations
-    % Modified to set spectral fields like op_CSIFourierTransform
-    
-    if nargout > 0 || ~isempty(inputname(1))
-        disp('=== START: op_NUFFTSpatial (Optimized) ===');
+function MRSIStruct = op_NUFFTSpatial(MRSIStruct, kFile, varargin)
+% Minimal & readable NUFFT recon that matches your slow SFT path.
+% Works for both dComp (5D) and dComp_w (4D) once reshapeDimensions is used.
+%
+% Example:
+%   ftFast  = op_NUFFTSpatial(dComp,   kFile, 'Calib', true, 'nCalT', 12, 'Verbose', true);
+%   ftFastW = op_NUFFTSpatial(dComp_w, kFile, 'Calib', true, 'nCalT', 12, 'Verbose', true);
+
+% -------- options --------
+p = inputParser;
+p.addParameter('Calib',   true,  @(x)islogical(x)||isscalar(x));
+p.addParameter('nCalT',   12,    @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+p.addParameter('Verbose', true,  @(x)islogical(x)||isscalar(x));
+p.parse(varargin{:});
+opt = p.Results;
+vprintf = @(varargin) ifvprintf(opt.Verbose, varargin{:});
+%% --------- Handle 4D data structure (no averages) -----------
+if ndims(MRSIStruct.data) == 5
+    %B = MRSIStruct;
+    Nt = MRSIStruct.sz(MRSIStruct.dims.t);
+    kPtsPerCycle = MRSIStruct.sz(MRSIStruct.dims.kpts);
+    nCoil = MRSIStruct.sz(MRSIStruct.dims.coils);
+    nAvg = MRSIStruct.sz(MRSIStruct.dims.averages);
+    nKy = MRSIStruct.sz(MRSIStruct.dims.kshot);
+    fprintf('Original size: %s\n', mat2str(size(MRSIStruct.data))); % e.g. [576 126 16 4 63]
+
+    % Permute to [kpts t coils avg shot]
+    A = permute(MRSIStruct.data, [4 1 2 3 5]);
+
+    % Reshape to [kpts*t, coils, avg, shot]
+    A = reshape(A, [kPtsPerCycle*Nt, nCoil, nAvg, nKy]);
+    fprintf('Reshaped size: %s\n', mat2str(size(A)));
+
+    MRSIStruct.data = A;
+    MRSIStruct.sz   = double([size(A,1), size(A,2), size(A,3), size(A,4)]);
+    %MRSIStruct = B;
+    MRSIStruct.dims.kshot=0;
+    MRSIStruct.dims.kpts=0;
+    MRSIStruct.dims.ky=4;
+    MRSIStruct.dims.t=1;
+
+elseif ndims(MRSIStruct.data) == 4
+    %B = MRSIStruct;
+    Nt = MRSIStruct.sz(MRSIStruct.dims.t);
+    kPtsPerCycle = MRSIStruct.sz(MRSIStruct.dims.kpts);
+    nCoil = MRSIStruct.sz(MRSIStruct.dims.coils);
+    %nAvg = MRSIStruct.sz(MRSIStruct.dims.averages);
+    nKy = MRSIStruct.sz(MRSIStruct.dims.kshot);
+    fprintf('Original size: %s\n', mat2str(size(MRSIStruct.data))); % e.g. [576 126 16 63]
+
+    % Permute to [kpts t coils shot]
+    A = permute(MRSIStruct.data, [3 1 2 4]); % [16 576 126 63]
+
+    % Reshape to [kpts*t, coils, shot]
+    A = reshape(A, [kPtsPerCycle*Nt, nCoil, nKy]);
+    fprintf('Reshaped size: %s\n', mat2str(size(A)));
+
+    MRSIStruct.data = A;
+    MRSIStruct.sz   = double([size(A,1), size(A,2), size(A,3)]);
+    MRSIStruct.dims.kshot=0;
+    MRSIStruct.dims.kpts=0;
+    MRSIStruct.dims.ky=3;
+    MRSIStruct.dims.t=1;
+    %MRSIStruct = B;
+end
+
+vprintf('=== START: op_NUFFTSpatial ===\n');
+
+% -------- read k (1/mm) --------
+[kTab, kXY] = readKFile_simple(kFile);       % kXY = [Kx Ky] in 1/mm
+if isempty(kXY), error('Could not read Kx,Ky from "%s".', kFile); end
+kXY = double(kXY(:,1:2));                    % [Nk x 2]
+Nk  = size(kXY,1);
+
+% -------- sizes like slow path --------
+sz   = MRSIStruct.sz;
+dims = MRSIStruct.dims;
+
+Nt_total = sz(dims.t);        % e.g., 72576
+nKy      = sz(dims.ky);       % e.g., 63
+if mod(Nk, nKy)~=0, error('Nk (%d) not divisible by nKy (%d).', Nk, nKy); end
+kPtsPerCycle = Nk / nKy;      % e.g., 126
+if mod(Nt_total, kPtsPerCycle)~=0
+    error('Nt_total (%d) not multiple of kPtsPerCycle (%d).', Nt_total, kPtsPerCycle);
+end
+NPtemporal = Nt_total / kPtsPerCycle;
+
+xCoords = getCoordinates(MRSIStruct, 'x');   % mm
+yCoords = getCoordinates(MRSIStruct, 'y');   % mm
+Nx = numel(xCoords); Ny = numel(yCoords);
+
+% reshape to [t ky extras] like SFT
+[MRSIStruct, prevPermute, prevSize] = reshapeDimensions(MRSIStruct, {'t','ky'});
+X = getData(MRSIStruct);                      % [Nt_total  nKy  Nextra]
+Nextra = size(X,3);                           % coils*averages, etc.
+
+vprintf('Nk=%d, nKy=%d, kPtsPerCycle=%d, NPtemporal=%d, Nx=%d, Ny=%d, Nextra=%d\n', ...
+        Nk, nKy, kPtsPerCycle, NPtemporal, Nx, Ny, Nextra);
+
+% -------- NUFFT grid spacing & shift (from coords) --------
+dx = median(abs(diff(xCoords(:))));
+dy = median(abs(diff(yCoords(:))));
+x_idx = (0:Nx-1).';  y_idx = (0:Ny-1).';
+x_shift = median( x_idx - xCoords(:)/dx );    % ~Nx/2 if centered at 0
+y_shift = median( y_idx - yCoords(:)/dy );    % ~Ny/2
+n_shift = [y_shift, x_shift];                 % [Ny-shift, Nx-shift] order
+Nd      = [Ny, Nx];
+vprintf('Inferred n_shift = [%.3f, %.3f]\n', y_shift, x_shift);
+
+% -------- SLOW SFT operator for calibration --------
+% (x,y) in mm; phase = + i*2π*(x*Kx + y*Ky) / Nk  (adjoint-equivalent scale)
+[xx, yy] = meshgrid(xCoords, yCoords);
+XY  = [xx(:), yy(:)];                         % [Ny*Nx x 2]
+SFT = exp(1i*2*pi * (XY * kXY.'));            % [Ny*Nx x Nk]
+SFT = SFT / Nk;
+
+% -------- NUFFT candidates (axis/sign) --------
+% NUFFT needs radians-per-index; convert 1/mm -> rad using 2π*k*Δ
+om_yx = [2*pi*kXY(:,2)*dy, 2*pi*kXY(:,1)*dx]; % [Ky,Kx] -> [y,x]
+cands = {
+  'om=[Ky,Kx] -> [y,x]',            om_yx
+  'om=[Kx,Ky] -> [y,x]',            [2*pi*kXY(:,1)*dy, 2*pi*kXY(:,2)*dx]
+  'om=[-Ky,+Kx]',                   [-om_yx(:,1),  +om_yx(:,2)]
+  'om=[+Ky,-Kx]',                   [ +om_yx(:,1), -om_yx(:,2)]
+  'om=[-Kx,+Ky]',                   [-2*pi*kXY(:,1)*dy, +2*pi*kXY(:,2)*dx]
+  'om=[+Kx,-Ky]',                   [ +2*pi*kXY(:,1)*dy, -2*pi*kXY(:,2)*dx]
+  'om=[-Ky,-Kx]',                   [-om_yx(:,1),  -om_yx(:,2)]
+  'om=[-Kx,-Ky]',                   [-2*pi*kXY(:,1)*dy, -2*pi*kXY(:,2)*dx]
+};
+
+% calibration frames
+cal_idx = 1:NPtemporal;
+if opt.Calib
+    nCal = min(opt.nCalT, NPtemporal);
+    cal_idx = unique(max(1, round(linspace(1, NPtemporal, nCal))));
+end
+
+% -------- pick best candidate + complex scale alpha --------
+Jd = [6,6];  Kd = 2*Nd;
+best.resid = inf;
+for ic = 1:size(cands,1)
+    name = cands{ic,1};
+    om   = cands{ic,2};
+    st   = nufft_init(om, Nd, Jd, Kd, n_shift);
+
+    % Least-squares alpha using a few t-frames
+    num = 0+0i; den = 0; resid = 0;
+    for it = cal_idx
+        i0 = (it-1)*kPtsPerCycle + 1;     i1 = it*kPtsPerCycle;
+        Y   = double(reshape(X(i0:i1, :, :), [], Nextra));     % [Nk x Nextra]
+        Zs  = SFT * Y;                                        % [Ny*Nx x Nextra]
+
+        Zn  = nufft_adj(Y, st);                                % [Ny x Nx x Nextra] or [Ny*Nx x Nextra]
+        ZnM = as_mat(Zn, Ny, Nx, Nextra);                      % -> [Ny*Nx x Nextra]
+
+        a = ZnM(:);  b = Zs(:);
+        num = num + (a' * b);
+        den = den + (a' * a);
+    end
+    alpha = (den~=0) * (num/den) + (den==0) * 1;
+
+    % residual
+    for it = cal_idx
+        i0 = (it-1)*kPtsPerCycle + 1;     i1 = it*kPtsPerCycle;
+        Y   = double(reshape(X(i0:i1, :, :), [], Nextra));
+        Zs  = SFT * Y;                                        % [Ny*Nx x Nextra]
+
+        Zn  = nufft_adj(Y, st);
+        ZnM = as_mat(Zn, Ny, Nx, Nextra);                     % [Ny*Nx x Nextra]
+
+        r   = alpha * ZnM - Zs;
+        resid = resid + norm(r(:))^2;
     end
 
-    %% Load and normalize k-trajectory (OPTIMIZED with caching)
-    persistent cached_kCoords cached_kFile cached_st cached_Nx cached_Ny;
-    
-    % Cache k-space trajectory and NUFFT structure
-    if isempty(cached_kCoords) || ~strcmp(cached_kFile, kFile_path)
-        if nargout > 0 || ~isempty(inputname(1))
-            disp(['Loading k-file: ', kFile_path]);
-        end
-        
-        [kTable, ~] = readKFile(kFile_path);
-        
-        % Handle different k-file formats
-        if istable(kTable)
-            if ismember('Kx', kTable.Properties.VariableNames) && ismember('Ky', kTable.Properties.VariableNames)
-                kCoords = [kTable.Kx, kTable.Ky];
-            else
-                % Try to find columns that look like coordinates
-                varNames = kTable.Properties.VariableNames;
-                if length(varNames) >= 3
-                    kCoords = [kTable{:, 2}, kTable{:, 3}]; % Assume columns 2,3 are Kx,Ky
-                else
-                    error('Cannot find Kx, Ky columns in k-file table');
-                end
-            end
+    vprintf('Cand %d: %s  | alpha=%+.6e%+.6ei  | resid=%.3e\n', ...
+            ic, name, real(alpha), imag(alpha), resid);
+
+    if resid < best.resid
+        best.name  = name;
+        best.st    = st;
+        best.alpha = alpha;
+        best.resid = resid;
+    end
+end
+vprintf('Selected: %s  | alpha=%+.6e%+.6ei  | resid=%.3e\n', ...
+        best.name, real(best.alpha), imag(best.alpha), best.resid);
+
+% -------- full recon --------
+img = zeros(NPtemporal, Ny, Nx, Nextra, 'like', double(X));
+for it = 1:NPtemporal
+    i0 = (it-1)*kPtsPerCycle + 1;     i1 = it*kPtsPerCycle;
+    Y  = double(reshape(X(i0:i1, :, :), [], Nextra));          % [Nk x Nextra]
+
+    Z  = best.alpha * nufft_adj(Y, best.st);                   % [Ny x Nx x Nextra] or [Ny*Nx x Nextra]
+    Z3 = as_cube(Z, Ny, Nx, Nextra);                           % -> [Ny x Nx x Nextra]
+
+    img(it,:,:,:) = Z3;
+end
+
+% -------- reshape back like slow SFT --------
+MRSIStruct = setData(MRSIStruct, double(img));
+kyDim = getDimension(MRSIStruct,'ky');
+prevPermute = removeDimPrevPermute(prevPermute, kyDim);
+prevPermute = addDimPrevPermute(prevPermute, 'y', kyDim);
+prevPermute = addDimPrevPermute(prevPermute, 'x', kyDim+1);
+prevSize(1) = NPtemporal; prevSize(2) = Ny;
+prevSize    = [prevSize(1:2), Nx, prevSize(3:end)];
+MRSIStruct  = reshapeBack(MRSIStruct, prevPermute, prevSize);
+
+% spectral values identical to slow path
+adcDT  = getAdcDwellTime(MRSIStruct);
+specDT = adcDT * kPtsPerCycle;
+specSW = 1 / specDT;
+specT  = 0:specDT:specDT*(NPtemporal-1);
+MRSIStruct = setSpectralWidth(MRSIStruct,  specSW);
+MRSIStruct = setSpectralDwellTime(MRSIStruct, specDT);
+MRSIStruct = setSpectralTime(MRSIStruct, specT);
+
+MRSIStruct = setFlags(MRSIStruct,'spatialFT',true);
+vprintf('=== END: op_NUFFTSpatial ===\n');
+end
+
+% ================= helpers =================
+function M = as_mat(Z, Ny, Nx, Nextra)
+% Return [Ny*Nx x Nextra]
+    if ndims(Z)==3 && all(size(Z)==[Ny Nx Nextra])
+        M = reshape(Z, Ny*Nx, Nextra);
+    elseif ismatrix(Z)
+        if size(Z,1)==Ny*Nx
+            M = Z;
+        elseif size(Z,1)==Ny && size(Z,2)==Nx*Nextra
+            M = reshape(Z, Ny*Nx, Nextra);
         else
-            % Handle as numeric matrix
-            if size(kTable, 2) >= 3
-                kCoords = kTable(:, 2:3);  % Extract kx, ky columns (columns 2,3)
-            else
-                error('K-file must have at least 3 columns for numeric format');
-            end
-        end
-        
-        % Vectorized normalization
-        kCoords = (kCoords / max(abs(kCoords(:)))) * pi;
-        
-        % Cache trajectory
-        cached_kCoords = kCoords;
-        cached_kFile = kFile_path;
-        
-        if nargout > 0 || ~isempty(inputname(1))
-            disp(['Cached kCoords shape = ', mat2str(size(kCoords))]);
+            M = reshape(Z, Ny*Nx, []);  % best-effort fallback
         end
     else
-        kCoords = cached_kCoords;
+        M = reshape(Z, Ny*Nx, []);      % best-effort fallback
     end
+end
 
-    % Pre-compute dimensions (OPTIMIZED)
-    sz = dComp.sz;
-    dims = dComp.dims;
-    nKshot = sz(dims.kshot);
-    nKpts = sz(dims.kpts);
-    totalKPoints = nKshot * nKpts;
-    
-    % Verify k-space dimensions once
-    if size(kCoords, 1) ~= totalKPoints
-        error('K-space file length (%d) does not match data k-space dimensions (%d)', ...
-              size(kCoords, 1), totalKPoints);
-    end
-
-    %% NUFFT setup (OPTIMIZED with caching)
-    Nx = length(dComp.coordinates.x);
-    Ny = length(dComp.coordinates.y);
-    
-    % Cache NUFFT structure for same dimensions
-    if isempty(cached_st) || cached_Nx ~= Nx || cached_Ny ~= Ny
-        Nd = [Nx, Ny];
-        Jd = [6, 6]; 
-        Kd = [2*Nx, 2*Ny]; 
-        n_shift = Nd/2;
-        
-        cached_st = nufft_init(kCoords, Nd, Jd, Kd, n_shift);
-        cached_Nx = Nx;
-        cached_Ny = Ny;
-        
-        if nargout > 0 || ~isempty(inputname(1))
-            disp('NUFFT initialized and cached.');
-        end
-    end
-    st = cached_st;
-
-    %% OPTIMIZED data processing with pre-allocation
-    dataSize = size(dComp.data);
-    hasAverages = (dims.averages > 0);
-    
-    if hasAverages && ndims(dComp.data) == 5
-        % 5D: [t, coils, averages, kshot, kpts] -> [kshot*kpts, t*coils*averages]
-        
-        % Direct reshape without intermediate permutation (MEMORY OPTIMIZED)
-        data_reshaped = reshape(dComp.data, [sz(1)*sz(2)*sz(3), sz(4)*sz(5)]);
-        data_transposed = data_reshaped.';  % [totalKPoints, t*coils*averages]
-        
-        % NUFFT transform
-        imgFlat = nufft_adj(data_transposed, st);
-        
-        % Direct reshape to final dimensions
-        imgData = reshape(imgFlat, [Nx, Ny, sz(1), sz(2), sz(3)]);
-        imgData = permute(imgData, [3, 4, 5, 2, 1]); % [t, coils, averages, x, y]
-        
-        % Update dimensions efficiently
-        new_dims = dims;
-        new_dims.x = 5;
-        new_dims.y = 4;
-        new_dims.kshot = 0;
-        new_dims.kpts = 0;
-        
-    elseif ~hasAverages && ndims(dComp.data) == 4
-        % 4D: [t, coils, kshot, kpts] -> [kshot*kpts, t*coils]
-        
-        % Direct reshape (MEMORY OPTIMIZED)
-        data_reshaped = reshape(dComp.data, [sz(1)*sz(2), sz(3)*sz(4)]);
-        data_transposed = data_reshaped.';  % [totalKPoints, t*coils]
-        
-        % NUFFT transform
-        imgFlat = nufft_adj(data_transposed, st);
-        
-        % Direct reshape to final dimensions
-        imgData = reshape(imgFlat, [Nx, Ny, sz(1), sz(2)]);
-        imgData = permute(imgData, [3, 4, 2, 1]); % [t, coils, x, y]
-        
-        % Update dimensions efficiently
-        new_dims = dims;
-        new_dims.x = 4;
-        new_dims.y = 3;
-        new_dims.kshot = 0;
-        new_dims.kpts = 0;
-        
+function C = as_cube(Z, Ny, Nx, Nextra)
+% Return [Ny x Nx x Nextra]
+    if ndims(Z)==3 && all(size(Z)==[Ny Nx Nextra])
+        C = Z;
+    elseif ismatrix(Z) && size(Z,1)==Ny*Nx
+        C = reshape(Z, Ny, Nx, []);
+    elseif ismatrix(Z) && size(Z,1)==Ny
+        C = reshape(Z, Ny, Nx, []);
     else
-        error('Unsupported data dimension: %d or averages flag inconsistent', ndims(dComp.data));
-    end
-
-    %% Update structure efficiently (OPTIMIZED)
-    ftSpatial = dComp;
-    ftSpatial.data = imgData;
-    ftSpatial.sz = size(imgData);
-    ftSpatial.dims = new_dims;
-    ftSpatial.flags.spatialFT = 1;
-    
-    % Clear k-space dimensions
-    ftSpatial.dims.kx = 0;
-    ftSpatial.dims.ky = 0;
-    
-    %% Calculate and set spectral values (like op_CSIFourierTransform)
-    % Read k-file again for spectral calculations
-    [kTable, ~] = readKFile(kFile_path);
-    kPtsPerCycle = getKPtsPerCycle(kTable);
-    NPtemporal = getTemporalPts(kTable, ftSpatial);
-    
-    % Calculate spectral parameters (matching op_CSIFourierTransform logic)
-    ftSpatial = calculateSpectralValues(ftSpatial, kPtsPerCycle, NPtemporal);
-    
-    if nargout > 0 || ~isempty(inputname(1))
-        disp(['Spectral width: ', num2str(ftSpatial.spectralWidth)]);
-        disp(['Spectral dwell time: ', num2str(ftSpatial.spectralDwellTime)]);
-        disp(['Spectral time length: ', num2str(length(ftSpatial.spectralTime))]);
-        disp('=== END: op_NUFFTSpatial (Optimized) ===');
+        C = reshape(Z, Ny, Nx, []);     % best-effort fallback
     end
 end
 
-%% Helper functions (matching op_CSIFourierTransform implementation)
-
-function MRSIStruct = calculateSpectralValues(MRSIStruct, kPtsPerCycle, NPtemporal)
-    % Calculate spectral parameters exactly like op_CSIFourierTransform
-    spectralDwellTime = calculateSpectralDwellTime(MRSIStruct, kPtsPerCycle);
-    spectralWidth = 1/spectralDwellTime;
-    spectralTime = calculateSpectralTime(spectralDwellTime, NPtemporal);
-
-    % Set spectral fields in structure
-    MRSIStruct.spectralWidth = spectralWidth;
-    MRSIStruct.spectralDwellTime = spectralDwellTime;
-    MRSIStruct.spectralTime = spectralTime;
-end
-
-function spectralDwellTime = calculateSpectralDwellTime(MRSIStruct, spatialPoints)
-    % Calculate spectral dwell time from ADC dwell time and spatial points
-    adcDwellTime = MRSIStruct.adcDwellTime;
-    spectralDwellTime = spatialPoints * adcDwellTime;
-end
-
-function spectralTime = calculateSpectralTime(spectralDwellTime, spatialPoints)
-    % Calculate spectral time vector
-    spectralTime = 0:spectralDwellTime:spectralDwellTime*(spatialPoints - 1);
-end
-
-function kPtsPerCycle = getKPtsPerCycle(kTable)
-    % Extract k-points per cycle from k-table
+function [kTable, kArray] = readKFile_simple(kFile)
+    kTable = []; kArray = [];
+    if isempty(kFile) || ~isfile(kFile), return; end
     try
-        if istable(kTable)
-            if ismember('TR', kTable.Properties.VariableNames)
-                % Find the maximum TR index in the trajectory
-                num_TR = max(kTable.TR, [], 'all');
-                % Divide the number of lines by the number of TRs
-                kPtsPerCycle = height(kTable)/num_TR;
-            else
-                % Default fallback for table without TR column
-                kPtsPerCycle = 126;
-            end
-        elseif ismatrix(kTable) && size(kTable, 2) >= 5
-            % Assume TR is in column 5 for numeric matrix
-            num_TR = max(kTable(:, 5), [], 'all');
-            if num_TR > 0
-                kPtsPerCycle = size(kTable, 1)/num_TR;
-            else
-                kPtsPerCycle = 126;
-            end
-        else
-            % Default fallback
-            kPtsPerCycle = 126; % Generally 126 for Rosette sequences
+        T = readtable(kFile);
+        kTable = T;
+        vn = lower(string(T.Properties.VariableNames));
+        ix = find(vn=="kx",1); iy = find(vn=="ky",1);
+        if ~isempty(ix) && ~isempty(iy)
+            kArray = [T{:,ix}, T{:,iy}];
+        elseif width(T)>=3
+            kArray = [T{:,2}, T{:,3}];
         end
     catch
-        % Fallback in case of any error
-        kPtsPerCycle = 126;
+        A = readmatrix(kFile);
+        if size(A,2)>=3, kArray = A(:,2:3); kTable = A; end
     end
 end
 
-function NPtemporal = getTemporalPts(kTable, dComp)
-    % Get temporal points from data structure
-    try
-        if isfield(dComp.dims, 't') && dComp.dims.t > 0
-            NPtemporal = dComp.sz(dComp.dims.t);
-        else
-            NPtemporal = dComp.sz(1); % Fallback to first dimension
-        end
-    catch
-        % Fallback
-        NPtemporal = size(dComp.data, 1);
-    end
+function ifvprintf(flag, varargin)
+    if flag, fprintf(varargin{:}); end
 end
 
-function [kTable, kArray] = readKFile(kFileName)
-    % Read k-space trajectory file with robust error handling
-    if isempty(kFileName) || ~isfile(kFileName)
-        kTable = [];
-        kArray = [];
-        return;
-    end
-    
-    try
-        % First try reading as table
-        kTable = readtable(kFileName);
-        
-        % Extract kx, ky coordinates
-        if istable(kTable)
-            if ismember('Kx', kTable.Properties.VariableNames) && ismember('Ky', kTable.Properties.VariableNames)
-                kArray = [kTable.Kx, kTable.Ky];
-            elseif width(kTable) >= 3
-                % Assume columns 2,3 are Kx, Ky
-                kArray = [kTable{:, 2}, kTable{:, 3}];
-            else
-                error('Table does not have enough columns');
-            end
-        end
-        
-    catch
-        % Fallback: try reading as numeric matrix
-        try
-            kTable = readmatrix(kFileName);
-            if size(kTable, 2) >= 3
-                kArray = kTable(:, 2:3); % Assume Kx, Ky are in columns 2, 3
-            else
-                error('Matrix does not have enough columns');
-            end
-        catch ME
-            warning('Failed to read k-file: %s. Error: %s', kFileName, ME.message);
-            kTable = [];
-            kArray = [];
-        end
-    end
-end
 
-%% ULTRA-FAST VERSION with pre-computed NUFFT
-function ftSpatial = op_NUFFTSpatial_UltraFast(dComp, kFile_path)
-    % ULTRA-FAST: Pre-computed NUFFT with minimal overhead
-    
-    persistent ultra_cached_st ultra_cached_kFile ultra_cached_dims;
-    
-    % Ultra-fast caching
-    if isempty(ultra_cached_st) || ~strcmp(ultra_cached_kFile, kFile_path)
-        [kTable, ~] = readKFile(kFile_path);
-        
-        % Handle different formats safely
-        if istable(kTable)
-            if ismember('Kx', kTable.Properties.VariableNames) && ismember('Ky', kTable.Properties.VariableNames)
-                kCoords = [kTable.Kx, kTable.Ky];
-            else
-                kCoords = [kTable{:, 2}, kTable{:, 3}];
-            end
-        else
-            kCoords = kTable(:, 2:3);
-        end
-        
-        kCoords = (kCoords / max(abs(kCoords(:)))) * pi;
-        
-        Nx = length(dComp.coordinates.x);
-        Ny = length(dComp.coordinates.y);
-        
-        ultra_cached_st = nufft_init(kCoords, [Nx, Ny], [6, 6], [2*Nx, 2*Ny], [Nx, Ny]/2);
-        ultra_cached_kFile = kFile_path;
-        ultra_cached_dims = [Nx, Ny];
-    end
-    
-    [Nx, Ny] = deal(ultra_cached_dims(1), ultra_cached_dims(2));
-    sz = dComp.sz;
-    hasAverages = (dComp.dims.averages > 0);
-    
-    % Ultra-fast processing
-    if hasAverages && ndims(dComp.data) == 5
-        % Direct vectorized operations
-        data_flat = reshape(permute(dComp.data, [4, 5, 1, 2, 3]), [], sz(1)*sz(2)*sz(3));
-        img_flat = nufft_adj(data_flat, ultra_cached_st);
-        imgData = permute(reshape(img_flat, Nx, Ny, sz(1), sz(2), sz(3)), [3, 4, 5, 1, 2]);
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(4, 5, 0, 0);
-        
-    else % 4D case
-        data_flat = reshape(permute(dComp.data, [3, 4, 1, 2]), [], sz(1)*sz(2));
-        img_flat = nufft_adj(data_flat, ultra_cached_st);
-        imgData = permute(reshape(img_flat, Nx, Ny, sz(1), sz(2)), [3, 4, 1, 2]);
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(3, 4, 0, 0);
-    end
-    
-    % Update structure
-    ftSpatial = dComp;
-    ftSpatial.data = imgData;
-    ftSpatial.sz = size(imgData);
-    ftSpatial.dims = new_dims;
-    ftSpatial.flags.spatialFT = 1;
-    
-    % Calculate and set spectral values (matching op_CSIFourierTransform)
-    [kTable, ~] = readKFile(kFile_path);
-    kPtsPerCycle = getKPtsPerCycle(kTable);
-    NPtemporal = getTemporalPts(kTable, ftSpatial);
-    ftSpatial = calculateSpectralValues(ftSpatial, kPtsPerCycle, NPtemporal);
-end
-
-%% MEMORY-OPTIMIZED VERSION for large datasets
-function ftSpatial = op_NUFFTSpatial_MemoryOptimized(dComp, kFile_path, chunk_size)
-    % MEMORY OPTIMIZED: Process data in chunks to reduce memory usage
-    
-    if nargin < 3
-        chunk_size = 1000; % Process 1000 time points at once
-    end
-    
-    % Setup (same as optimized version)
-    [kTable, ~] = readKFile(kFile_path);
-    
-    % Handle different formats safely
-    if istable(kTable)
-        if ismember('Kx', kTable.Properties.VariableNames) && ismember('Ky', kTable.Properties.VariableNames)
-            kCoords = [kTable.Kx, kTable.Ky];
-        else
-            kCoords = [kTable{:, 2}, kTable{:, 3}];
-        end
-    else
-        kCoords = kTable(:, 2:3);
-    end
-    
-    kCoords = (kCoords / max(abs(kCoords(:)))) * pi;
-    
-    Nx = length(dComp.coordinates.x);
-    Ny = length(dComp.coordinates.y);
-    st = nufft_init(kCoords, [Nx, Ny], [6, 6], [2*Nx, 2*Ny], [Nx, Ny]/2);
-    
-    sz = dComp.sz;
-    hasAverages = (dComp.dims.averages > 0);
-    
-    if hasAverages && ndims(dComp.data) == 5
-        % Process in chunks for 5D data
-        imgData = zeros(sz(1), sz(2), sz(3), Nx, Ny, 'like', dComp.data);
-        
-        for t_start = 1:chunk_size:sz(1)
-            t_end = min(t_start + chunk_size - 1, sz(1));
-            t_indices = t_start:t_end;
-            
-            % Process chunk
-            data_chunk = dComp.data(t_indices, :, :, :, :);
-            data_flat = reshape(permute(data_chunk, [4, 5, 1, 2, 3]), [], numel(data_chunk)/(sz(4)*sz(5)));
-            img_flat = nufft_adj(data_flat, st);
-            imgData(t_indices, :, :, :, :) = permute(reshape(img_flat, Nx, Ny, length(t_indices), sz(2), sz(3)), [3, 4, 5, 1, 2]);
-        end
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(4, 5, 0, 0);
-        
-    else % 4D case - similar chunking
-        imgData = zeros(sz(1), sz(2), Nx, Ny, 'like', dComp.data);
-        
-        for t_start = 1:chunk_size:sz(1)
-            t_end = min(t_start + chunk_size - 1, sz(1));
-            t_indices = t_start:t_end;
-            
-            data_chunk = dComp.data(t_indices, :, :, :);
-            data_flat = reshape(permute(data_chunk, [3, 4, 1, 2]), [], numel(data_chunk)/(sz(3)*sz(4)));
-            img_flat = nufft_adj(data_flat, st);
-            imgData(t_indices, :, :, :) = permute(reshape(img_flat, Nx, Ny, length(t_indices), sz(2)), [3, 4, 1, 2]);
-        end
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(3, 4, 0, 0);
-    end
-    
-    % Update structure
-    ftSpatial = dComp;
-    ftSpatial.data = imgData;
-    ftSpatial.sz = size(imgData);
-    ftSpatial.dims = new_dims;
-    ftSpatial.flags.spatialFT = 1;
-    
-    % Calculate and set spectral values (matching op_CSIFourierTransform)
-    kPtsPerCycle = getKPtsPerCycle(kTable);
-    NPtemporal = getTemporalPts(kTable, ftSpatial);
-    ftSpatial = calculateSpectralValues(ftSpatial, kPtsPerCycle, NPtemporal);
-end
-
-%% PARALLEL VERSION using Parallel Computing Toolbox
-function ftSpatial = op_NUFFTSpatial_Parallel(dComp, kFile_path)
-    % PARALLEL: Use parallel processing for NUFFT transforms
-    
-    % Check if Parallel Computing Toolbox is available
-    if ~license('test', 'Distrib_Computing_Toolbox') || isempty(gcp('nocreate'))
-        warning('Parallel Computing Toolbox not available. Using standard version.');
-        ftSpatial = op_NUFFTSpatial(dComp, kFile_path);
-        return;
-    end
-    
-    % Setup
-    [kTable, ~] = readKFile(kFile_path);
-    
-    % Handle different formats safely
-    if istable(kTable)
-        if ismember('Kx', kTable.Properties.VariableNames) && ismember('Ky', kTable.Properties.VariableNames)
-            kCoords = [kTable.Kx, kTable.Ky];
-        else
-            kCoords = [kTable{:, 2}, kTable{:, 3}];
-        end
-    else
-        kCoords = kTable(:, 2:3);
-    end
-    
-    kCoords = (kCoords / max(abs(kCoords(:)))) * pi;
-    
-    Nx = length(dComp.coordinates.x);
-    Ny = length(dComp.coordinates.y);
-    st = nufft_init(kCoords, [Nx, Ny], [6, 6], [2*Nx, 2*Ny], [Nx, Ny]/2);
-    
-    sz = dComp.sz;
-    hasAverages = (dComp.dims.averages > 0);
-    
-    if hasAverages && ndims(dComp.data) == 5
-        % Parallel processing for 5D data
-        data_cell = cell(sz(3), 1); % Split by averages
-        
-        parfor avg = 1:sz(3)
-            data_avg = squeeze(dComp.data(:, :, avg, :, :));
-            data_flat = reshape(permute(data_avg, [3, 4, 1, 2]), [], sz(1)*sz(2));
-            img_flat = nufft_adj(data_flat, st);
-            data_cell{avg} = permute(reshape(img_flat, Nx, Ny, sz(1), sz(2)), [3, 4, 1, 2]);
-        end
-        
-        % Combine results
-        imgData = cat(3, data_cell{:});
-        imgData = permute(imgData, [1, 2, 3, 5, 4]); % [t, coils, averages, x, y]
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(4, 5, 0, 0);
-        
-    else % 4D case
-        % Parallel processing for 4D data
-        data_cell = cell(sz(2), 1); % Split by coils
-        
-        parfor coil = 1:sz(2)
-            data_coil = squeeze(dComp.data(:, coil, :, :));
-            data_flat = reshape(permute(data_coil, [2, 3, 1]), [], sz(1));
-            img_flat = nufft_adj(data_flat, st);
-            data_cell{coil} = permute(reshape(img_flat, Nx, Ny, sz(1)), [3, 1, 2]);
-        end
-        
-        % Combine results
-        imgData = cat(2, data_cell{:});
-        imgData = permute(imgData, [1, 2, 4, 3]); % [t, coils, x, y]
-        
-        new_dims = dComp.dims;
-        [new_dims.x, new_dims.y, new_dims.kshot, new_dims.kpts] = deal(3, 4, 0, 0);
-    end
-    
-    % Update structure
-    ftSpatial = dComp;
-    ftSpatial.data = imgData;
-    ftSpatial.sz = size(imgData);
-    ftSpatial.dims = new_dims;
-    ftSpatial.flags.spatialFT = 1;
-    
-    % Calculate and set spectral values (matching op_CSIFourierTransform)
-    kPtsPerCycle = getKPtsPerCycle(kTable);
-    NPtemporal = getTemporalPts(kTable, ftSpatial);
-    ftSpatial = calculateSpectralValues(ftSpatial, kPtsPerCycle, NPtemporal);
-end
-
-%% BENCHMARKING FUNCTION
-function benchmark_op_NUFFTSpatial(dComp, kFile_path)
-    fprintf('=== op_NUFFTSpatial Performance Benchmark ===\n');
-    
-    % Test original version
-    tic;
-    result1 = op_NUFFTSpatial(dComp, kFile_path);
-    time_original = toc;
-    
-    % Test ultra-fast version
-    tic;
-    result2 = op_NUFFTSpatial_UltraFast(dComp, kFile_path);
-    time_ultrafast = toc;
-    
-    % Test memory-optimized version
-    tic;
-    result3 = op_NUFFTSpatial_MemoryOptimized(dComp, kFile_path);
-    time_memory = toc;
-    
-    % Report results
-    fprintf('Original version:        %.3f seconds\n', time_original);
-    fprintf('Ultra-fast version:      %.3f seconds (%.1fx faster)\n', time_ultrafast, time_original/time_ultrafast);
-    fprintf('Memory-optimized:        %.3f seconds (%.1fx faster)\n', time_memory, time_original/time_memory);
-    
-    % Verify results are similar (allowing for numerical precision differences)
-    diff1 = max(abs(result1.data(:) - result2.data(:)));
-    diff2 = max(abs(result1.data(:) - result3.data(:)));
-    
-    fprintf('Max difference (ultra-fast): %.2e\n', diff1);
-    fprintf('Max difference (memory-opt): %.2e\n', diff2);
-    
-    if diff1 < 1e-10 && diff2 < 1e-10
-        fprintf('✓ All versions produce nearly identical results\n');
-    else
-        fprintf('⚠ Results differ - check implementation\n');
-    end
-    
-    % Check spectral field consistency
-    fprintf('\n=== Spectral Field Verification ===\n');
-    fprintf('spectralWidth: %.4e (orig) vs %.4e (ultra) vs %.4e (mem)\n', ...
-        result1.spectralWidth, result2.spectralWidth, result3.spectralWidth);
-    fprintf('spectralDwellTime: %.4e (orig) vs %.4e (ultra) vs %.4e (mem)\n', ...
-        result1.spectralDwellTime, result2.spectralDwellTime, result3.spectralDwellTime);
-    fprintf('spectralTime length: %d (orig) vs %d (ultra) vs %d (mem)\n', ...
-        length(result1.spectralTime), length(result2.spectralTime), length(result3.spectralTime));
-end
+% function MRSIStruct = op_NUFFTSpatial(MRSIStruct, kFile, varargin)
+% % NUFFT-based spatial recon that matches the slow SFT path on your data.
+% % Usage:
+% %   ftFast  = op_NUFFTSpatial(dComp,   kFile, 'Calib', true, 'nCalT', 12, 'Verbose', true);
+% %   ftFastW = op_NUFFTSpatial(dComp_w, kFile, 'Calib', true, 'nCalT', 12, 'Verbose', true);
+% 
+% % -------- options --------
+% p = inputParser;
+% p.addParameter('Calib',   true,  @(x)islogical(x)||isscalar(x));
+% p.addParameter('nCalT',   12,    @(x)isnumeric(x)&&isscalar(x)&&x>=1);
+% p.addParameter('Verbose', true,  @(x)islogical(x)||isscalar(x));
+% p.parse(varargin{:});
+% opt = p.Results;
+% 
+% vprint = @(varargin) ifvprintf(opt.Verbose, varargin{:});
+% vprint('=== START: op_NUFFTSpatial ===\n');
+% 
+% % -------- read k-trajectory (1/mm) --------
+% [kTab, kXY] = readKFile_local(kFile);   % kXY: [Nk x 2] = [Kx, Ky] in 1/mm
+% if isempty(kXY) || size(kXY,2) < 2
+%     error('Failed to read Kx,Ky from "%s".', kFile);
+% end
+% kXY = double(kXY(:,1:2));
+% Nk  = size(kXY,1);
+% 
+% % -------- sizes & reshape like SFT path --------
+% sz   = MRSIStruct.sz;
+% dims = MRSIStruct.dims;
+% 
+% it_t  = dims.t;   Nt_total = sz(it_t);     % 72576
+% it_ky = dims.ky;  nKy      = sz(it_ky);    % 63
+% 
+% kPtsPerCycle = getKPtsPerCycle_local(kTab); % 126
+% if mod(Nt_total, kPtsPerCycle) ~= 0
+%     error('Nt_total (%d) not multiple of kPtsPerCycle (%d).', Nt_total, kPtsPerCycle);
+% end
+% NPtemporal = Nt_total / kPtsPerCycle;       % 576
+% 
+% % Target image grid (40x40 from coordinates)
+% xCoords = getCoordinates(MRSIStruct, 'x');  % mm
+% yCoords = getCoordinates(MRSIStruct, 'y');  % mm
+% Nx = length(xCoords);
+% Ny = length(yCoords);
+% if Nx<=0 || Ny<=0
+%     error('Empty coordinates.x / coordinates.y; cannot determine image size.');
+% end
+% 
+% % Reshape to [t_total, ky, extras] (same as slow path)
+% [MRSIStruct, prevPermute, prevSize] = reshapeDimensions(MRSIStruct, {'t','ky'});
+% X = getData(MRSIStruct);                    % [Nt_total  nKy  Nextra]
+% if ndims(X)=3 || size(X,1)=Nt_total || size(X,2)~=nKy
+%     error('Unexpected shape after reshapeDimensions: %s', mat2str(size(X)));
+% end
+% Nextra = size(X,3);
+% 
+% vprint('Nk=%d, nKy=%d, kPtsPerCycle=%d, NPtemporal=%d, Nx=%d, Ny=%d, Nextra=%d\n', ...
+%        Nk, nKy, kPtsPerCycle, NPtemporal, Nx, Ny, Nextra);
+% 
+% if Nk ~= kPtsPerCycle * nKy
+%     error('Trajectory rows (%d) != kPtsPerCycle (%d) * nKy (%d).', Nk, kPtsPerCycle, nKy);
+% end
+% 
+% % -------- voxel pitch & NUFFT grid shift from coordinates --------
+% dx = median(abs(diff(xCoords(:))));
+% dy = median(abs(diff(yCoords(:))));
+% if ~(isfinite(dx)&&dx>0 && isfinite(dy)&&dy>0)
+%     error('Bad voxel pitch: dx=%.3g, dy=%.3g', dx, dy);
+% end
+% 
+% % Find exact n_shift so that (n - n_shift)*d? ~ coords (least squares)
+% x_idx = (0:Nx-1).';  x_shift = median( x_idx - xCoords(:)/dx );
+% y_idx = (0:Ny-1).';  y_shift = median( y_idx - yCoords(:)/dy );
+% n_shift = [y_shift, x_shift];     % [Ny-shift, Nx-shift]
+% Nd      = [Ny, Nx];
+% vprint('Inferred n_shift = [%.3f, %.3f] (ideal would be [%g, %g])\n', ...
+%        y_shift, x_shift, Ny/2, Nx/2);
+% 
+% % -------- SFT operator (for calibration only; uses physical coords) --------
+% [xg, yg]  = meshgrid(xCoords, yCoords);     % Ny x Nx
+% imgTrajXY = [xg(:), yg(:)];                 % [Ny*Nx x 2]
+% sftOp = sft2_Operator_local(kXY, imgTrajXY, 1);  % [Ny*Nx x Nk], normalized by Nk
+% 
+% % -------- NUFFT candidates (axis/sign) --------
+% % NUFFT expects om (radians per index), so om = 2π * k(1/mm) * Δ(mm)
+% om_xy = [ 2*pi*kXY(:,1)*dx , 2*pi*kXY(:,2)*dy ];  % [ωy? ωx? careful]
+% om_yx = [ 2*pi*kXY(:,2)*dy , 2*pi*kXY(:,1)*dx ];
+% cands = {};
+% cands = pushcand(cands, 'om=[Ky,Kx] -> [y,x]', om_yx, Nd);
+% cands = pushcand(cands, 'om=[Kx,Ky] -> [y,x]', om_xy, Nd);
+% % sign flips
+% cands = pushcand(cands, '-Ky,+Kx', [-om_yx(:,1), +om_yx(:,2)], Nd);
+% cands = pushcand(cands, '+Ky,-Kx', [+om_yx(:,1), -om_yx(:,2)], Nd);
+% cands = pushcand(cands, '-Kx,+Ky', [-om_xy(:,1), +om_xy(:,2)], Nd);
+% cands = pushcand(cands, '+Kx,-Ky', [+om_xy(:,1), -om_xy(:,2)], Nd);
+% cands = pushcand(cands, '-Ky,-Kx', [-om_yx(:,1), -om_yx(:,2)], Nd);
+% cands = pushcand(cands, '-Kx,-Ky', [-om_xy(:,1), -om_xy(:,2)], Nd);
+% 
+% % -------- quick calibration (pick axis/sign and complex scale α) --------
+% cal_idx = 1:NPtemporal;
+% if opt.Calib
+%     nCal = min(opt.nCalT, NPtemporal);
+%     cal_idx = unique(max(1, round(linspace(1, NPtemporal, nCal))));
+% end
+% 
+% best.st = [];
+% best.alpha = 1;
+% best.resid = inf;
+% best.name = '';
+% 
+% Jd = [6,6];               % kernel size
+% Kd = 2*Nd;                % oversamp
+% 
+% for ic = 1:size(cands,1)
+%     name = cands{ic,1};
+%     om   = cands{ic,2};
+%     Nd_  = cands{ic,3};
+% 
+%     st = nufft_init(om, Nd_, Jd, Kd, n_shift);
+% 
+%     if isempty(cal_idx)
+%         alpha = 1; resid = 0;
+%     else
+%         num = 0+0i; den = 0; rsum = 0;
+%         for it = cal_idx
+%             i0 = (it-1)*kPtsPerCycle + 1;
+%             i1 = it*kPtsPerCycle;
+% 
+%             Y = double(reshape(X(i0:i1, :, :), [], Nextra));   % [Nk x Nextra]
+%             Zsft = sftOp * Y;                                  % [Ny*Nx x Nextra]
+%             Znu  = nufft_adj(Y, st);                           % [Ny*Nx x Nextra]
+% 
+%             % LS alpha: minimize ||alpha*Znu - Zsft||
+%             a = Znu(:); b = Zsft(:);
+%             num = num + (a' * b);
+%             den = den + (a' * a);
+%         end
+%         alpha = (den~=0) * (num/den) + (den==0) * 1;
+% 
+%         for it = cal_idx
+%             i0 = (it-1)*kPtsPerCycle + 1;
+%             i1 = it*kPtsPerCycle;
+%             Y   = double(reshape(X(i0:i1, :, :), [], Nextra));
+%             Zsft= sftOp * Y;
+%             Znu = alpha * nufft_adj(Y, st);
+%             rsum= rsum + norm(Znu(:) - Zsft(:))^2;
+%         end
+%         resid = rsum;
+%     end
+% 
+%     vprint('Cand %d: %s  | alpha=%+.6e%+.6ei  | resid=%.3e\n', ic, name, real(alpha), imag(alpha), resid);
+% 
+%     if resid < best.resid
+%         best.st    = st;
+%         best.alpha = alpha;
+%         best.resid = resid;
+%         best.name  = name;
+%     end
+% end
+% 
+% vprint('Selected: %s  | alpha=%+.6e%+.6ei  | resid=%.3e\n', best.name, real(best.alpha), imag(best.alpha), best.resid);
+% 
+% % -------- full reconstruction --------
+% image = zeros(NPtemporal, Ny, Nx, Nextra, 'like', double(X));
+% 
+% for it = 1:NPtemporal
+%     i0 = (it-1)*kPtsPerCycle + 1;
+%     i1 = it*kPtsPerCycle;
+% 
+%     Y = double(reshape(X(i0:i1, :, :), [], Nextra));      % [Nk x Nextra]
+%     Z = best.alpha * nufft_adj(Y, best.st);               % [Ny*Nx x Nextra]
+%     Z = reshape(Z, [Ny, Nx, Nextra]);
+%     image(it, :, :, :) = Z;
+% end
+% 
+% % -------- restore dims like slow path --------
+% MRSIStruct = setData(MRSIStruct, double(image));
+% 
+% kyDim = getDimension(MRSIStruct, 'ky');
+% prevPermute = removeDimPrevPermute(prevPermute, kyDim);
+% prevPermute = addDimPrevPermute(prevPermute, 'y', kyDim);
+% prevPermute = addDimPrevPermute(prevPermute, 'x', kyDim + 1);
+% 
+% prevSize(1) = NPtemporal;
+% prevSize(2) = Ny;
+% prevSize    = [prevSize(1:2), Nx, prevSize(3:end)];
+% 
+% MRSIStruct = reshapeBack(MRSIStruct, prevPermute, prevSize);
+% 
+% % spectral values identical to slow path
+% MRSIStruct = calculateSpectralValues_local(MRSIStruct, kPtsPerCycle, NPtemporal);
+% 
+% % flag
+% MRSIStruct = setFlags(MRSIStruct, 'spatialFT', true);
+% 
+% vprint('=== END: op_NUFFTSpatial ===\n');
+% end
+% 
+% % ================= helpers =================
+% function v = ifvprintf(flag, varargin)
+% if flag, fprintf(varargin{:}); end
+% v = [];
+% end
+% 
+% function [kTable, kArray] = readKFile_local(kFileName)
+% kTable = [];
+% kArray = [];
+% if isempty(kFileName) || ~isfile(kFileName), return; end
+% try
+%     T = readtable(kFileName);
+%     kTable = T;
+%     vn = lower(string(T.Properties.VariableNames));
+%     if any(vn=="kx") && any(vn=="ky")
+%         kArray = [T{:, find(vn=="kx",1)}, T{:, find(vn=="ky",1)}];
+%     elseif width(T) >= 3
+%         kArray = [T{:,2}, T{:,3}];
+%     end
+% catch
+%     try
+%         A = readmatrix(kFileName);
+%         if size(A,2) >= 3
+%             kArray = A(:,2:3);
+%             kTable = A;
+%         end
+%     catch
+%         kArray = [];
+%         kTable = [];
+%     end
+% end
+% end
+% 
+% function kPtsPerCycle = getKPtsPerCycle_local(kTable)
+% kPtsPerCycle = 126;
+% try
+%     if istable(kTable)
+%         vn = lower(string(kTable.Properties.VariableNames));
+%         if any(vn=="tr")
+%             nTR = max(kTable{:, find(vn=="tr",1)}, [], 'all');
+%             if nTR > 0
+%                 kPtsPerCycle = round(height(kTable)/nTR);
+%             end
+%         end
+%     elseif isnumeric(kTable) && size(kTable,2) >= 5
+%         nTR = max(kTable(:,5), [], 'all');
+%         if nTR > 0, kPtsPerCycle = round(size(kTable,1)/nTR); end
+%     end
+% catch
+%     kPtsPerCycle = 126;
+% end
+% end
+% 
+% function S = sft2_Operator_local(InTraj, OutTraj, Ift_flag)
+% % InTraj: [Nk x 2] = [Kx, Ky] in 1/mm
+% % OutTraj: [Ny*Nx x 2] = [x(mm), y(mm)]
+% % Ift_flag=1 => adjoint (divide by Nk)
+% if Ift_flag, Expy = 2*pi*1i; else, Expy = -2*pi*1i; end
+% NOut = size(OutTraj,1);
+% Nk   = size(InTraj,1);
+% S = zeros(NOut, Nk);
+% % exp(i 2π (x*Kx + y*Ky))
+% for j = 1:NOut
+%     S(j,:) = exp( Expy*( OutTraj(j,1)*InTraj(:,1).' + OutTraj(j,2)*InTraj(:,2).' ) );
+% end
+% if Ift_flag, S = S / Nk; end
+% end
+% 
+% function MRSIStruct = calculateSpectralValues_local(MRSIStruct, kPtsPerCycle, NPtemporal)
+% adcDwellTime       = getAdcDwellTime(MRSIStruct);
+% spectralDwellTime  = kPtsPerCycle * adcDwellTime;
+% spectralWidth      = 1 / spectralDwellTime;
+% spectralTime       = 0:spectralDwellTime:spectralDwellTime*(NPtemporal-1);
+% MRSIStruct = setSpectralWidth(MRSIStruct, spectralWidth);
+% MRSIStruct = setSpectralDwellTime(MRSIStruct, spectralDwellTime);
+% MRSIStruct = setSpectralTime(MRSIStruct, spectralTime);
+% end
+% 
+% function c = pushcand(c, name, om, Nd)
+% % append one candidate row
+% c(end+1,:) = {name, om, Nd};
+% end

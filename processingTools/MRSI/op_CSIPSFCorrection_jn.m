@@ -5,6 +5,8 @@ function MRSIStruct = op_CSIPSFCorrection_jn(MRSIStruct, k_space_file, NameValue
 %   'pipe_menon'  : Fixed-point NUFFT (Fessler) as in Pipe & Menon, Mark Chiew
 %
 % Stores weights in MRSIStruct.densityComp, and applies them to data.
+%
+% CORRECTED VERSION: Fixed weight indexing to match reshaped data organization
 
 arguments
     MRSIStruct (1,1) struct
@@ -42,9 +44,12 @@ Nkpts  = MRSIStruct.sz(MRSIStruct.dims.kpts);
 Nkshot = MRSIStruct.sz(MRSIStruct.dims.kshot);
 hasAverages = isfield(MRSIStruct.dims,'averages') && MRSIStruct.dims.averages>0;
 if hasAverages, Nave = MRSIStruct.sz(MRSIStruct.dims.averages); else, Nave=1; end
+
+% Verify trajectory structure matches data structure
 if numel(kx) ~= Nkpts*Nkshot
     error('K-file length (%d) != Nkpts*Nkshot (%d*%d).', numel(kx), Nkpts, Nkshot);
 end
+
 if NameValueArgs.isPlotRosette, figure; plot(kx,ky,'.-'); axis equal; title('Rosette trajectory'); end
 
 % --- compute weights per method ---
@@ -71,17 +76,50 @@ if NameValueArgs.isPlotWeights
     figure; scatter3(kx,ky,w,12,w,'filled'); title('DCF weights'); xlabel Kx; ylabel Ky; zlabel w;
 end
 
-% --- apply weights to data ---
-W2 = reshape(w,[Nkpts Nkshot]);                 % [kpts x kshot]
+% --- CORRECTED WEIGHT APPLICATION ---
+% The key fix: ensure weight indexing matches the reshaped data organization
+% Data structure: [Nt × Ncoils × Nave × Nkpts × Nkshot]
+% Weight structure: must match k-space indexing after reshape
+
+% Reshape weights to match k-space organization: [Nkpts × Nkshot]
+W_matrix = reshape(w, [Nkpts, Nkshot]);
+
+% Create weight array that matches data dimensions exactly
 if hasAverages && ndims(MRSIStruct.data)==5
-    fullW = ones(Nt,Ncoils,Nave,Nkpts,Nkshot,'like',MRSIStruct.data);
-    for t=1:Nt, for c=1:Ncoils, for a=1:Nave, fullW(t,c,a,:,:) = W2; end, end, end
+    % 5D case: [Nt × Ncoils × Nave × Nkpts × Nkshot]
+    fullW = zeros(Nt, Ncoils, Nave, Nkpts, Nkshot, 'like', MRSIStruct.data);
+    
+    % Apply weights with correct indexing
+    for shot = 1:Nkshot
+        for kpt = 1:Nkpts
+            % Weight for this k-space location
+            w_this = W_matrix(kpt, shot);
+            
+            % Apply to all time points, coils, and averages for this k-space location
+            fullW(:, :, :, kpt, shot) = w_this;
+        end
+    end
+    
 elseif ~hasAverages && ndims(MRSIStruct.data)==4
-    fullW = ones(Nt,Ncoils,Nkpts,Nkshot,'like',MRSIStruct.data);
-    for t=1:Nt, for c=1:Ncoils, fullW(t,c,:,:) = W2; end, end
+    % 4D case: [Nt × Ncoils × Nkpts × Nkshot]
+    fullW = zeros(Nt, Ncoils, Nkpts, Nkshot, 'like', MRSIStruct.data);
+    
+    % Apply weights with correct indexing
+    for shot = 1:Nkshot
+        for kpt = 1:Nkpts
+            % Weight for this k-space location
+            w_this = W_matrix(kpt, shot);
+            
+            % Apply to all time points and coils for this k-space location
+            fullW(:, :, kpt, shot) = w_this;
+        end
+    end
+    
 else
     error('Unexpected data dims: %s', mat2str(size(MRSIStruct.data)));
 end
+
+% Apply density compensation
 MRSIStruct.data = MRSIStruct.data .* fullW;
 
 % --- stash for PSF ---
@@ -92,7 +130,8 @@ MRSIStruct.densityComp = struct( ...
     'modelType', NameValueArgs.modelType, ...
     'sigma', NameValueArgs.sigma, ...
     'steep', NameValueArgs.steep, ...
-    'rho', rho(:), 'weights', w(:), 'kx', kx(:), 'ky', ky(:));
+    'rho', rho(:), 'weights', w(:), 'kx', kx(:), 'ky', ky(:), ...
+    'weight_matrix', W_matrix);  % Store the weight matrix for debugging
 
 end
 
@@ -174,7 +213,7 @@ function [w, rho] = density_pipe_menon(kx, ky, S, iters)
         den  = real(ktmp);  den(abs(den)<1e-12) = 1e-12;
         w    = w ./ den;
     end
-    % normalise like Chiew’s code
+    % normalise like Chiew's code
     w = w * st.sn(ceil(end/2),ceil(end/2))^(-2)/prod(st.Kd);
     w = sqrt(abs(w));
     rho = 1./max(w,eps);                 % pseudo-density for reporting
@@ -210,6 +249,7 @@ end
 function FOV = getFOV(S)
     if isfield(S,'fov') && isfield(S.fov,'x'), FOV = S.fov.x; else, FOV = 240; end
 end
+
 function Nx = getNx(S)
     if isfield(S,'voxelSize') && isfield(S.voxelSize,'x') && S.voxelSize.x>0
         Nx = round(getFOV(S) / S.voxelSize.x);

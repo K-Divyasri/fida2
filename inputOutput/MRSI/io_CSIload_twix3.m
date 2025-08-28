@@ -51,7 +51,9 @@ end
 assert(~isempty(dwelltime) && dwelltime>0, ...
        'Unable to determine dwell‑time – check kFile path or TWIX header.');
 
-adcTime         = 0 : dwelltime : (size(rawData, dims.t)-1)*dwelltime;
+adcTime         = 0 : dwelltime : ((size(rawData, dims.t)*size(rawData, dims.extras))-1)*dwelltime;
+%adcTime = 0 : dwelltime : (size(rawData, dims.t)*dims.extras - 1) * dwelltime;
+
 spectralWidth   = 1/dwelltime;
 
 %% 3) Basic acquisition dimensions ---------------------------------------

@@ -17,6 +17,8 @@ function [timeCombined_sh, timeCombined_sh_w] = load_twix2(fileName, fileName_w,
     %timeCombined_w.adcTime = timeCombined_w.adcDwellTime * (0:(timeCombined_w.sz(1)-1));
     
     % Shift
+    x=0;
+    y=0;
     fprintf('Applying spatial shifts...\n');
     if isempty(kFile)
         % Cartesian shift using default or dummy inputs
